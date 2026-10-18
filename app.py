@@ -20,7 +20,7 @@ st.markdown(
 )
 
 # SEC דורש זיהוי אמיתי. החלף לשם ולכתובת המייל שלך.
-SEC_HEADERS = {"User-Agent": "Nadav nadav@example.com"}
+SEC_HEADERS = {"Nadav": "nadavtshuva2@gmail.com"}
 
 METRICS = [
     "הכנסות",
