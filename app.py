@@ -1,6 +1,6 @@
-
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -19,6 +19,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# SEC דורש זיהוי אמיתי. החלף לשם ולכתובת המייל שלך.
+SEC_HEADERS = {"User-Agent": "Nadav nadav@example.com"}
+
 METRICS = [
     "הכנסות",
     "רווח למניה",
@@ -31,6 +34,21 @@ METRICS = [
 QUARTERLY = {"הכנסות", "רווח למניה", "שולי רווח נקי", "מכפיל רווח"}
 ANNUAL = {"יחס חוב לתזרים (שנתי)", "הכנסה לעובד (שנתי)"}
 
+REV_TAGS = [
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "SalesRevenueNet",
+]
+NI_TAGS = ["NetIncomeLoss", "ProfitLoss"]
+EPS_TAGS = ["EarningsPerShareDiluted", "EarningsPerShareBasic"]
+OCF_TAGS = ["NetCashProvidedByUsedInOperatingActivities"]
+CAPEX_TAGS = [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+    "PaymentsForCapitalImprovements",
+]
+
 
 def fmt(v, kind="num"):
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -40,10 +58,12 @@ def fmt(v, kind="num"):
             return f"{v:.2f}x"
         if kind == "pct":
             return f"{v:.1f}%"
+        if kind == "B":
+            return f"{v:,.2f}B"
+        if kind == "M":
+            return f"{v:,.1f}M"
         if kind == "money":
             a = abs(v)
-            if a >= 1e12:
-                return f"{v / 1e12:.2f}T"
             if a >= 1e9:
                 return f"{v / 1e9:.2f}B"
             if a >= 1e6:
@@ -52,25 +72,6 @@ def fmt(v, kind="num"):
         return f"{v:,.2f}"
     except Exception:
         return "—"
-
-
-def safe_div(a, b):
-    try:
-        if a is None or b is None or pd.isna(a) or pd.isna(b) or b == 0:
-            return None
-        return a / b
-    except Exception:
-        return None
-
-
-def row(df, names):
-    """סדרה לפי תאריכים (מהישן לחדש) לפי רשימת שמות אפשריים."""
-    if df is None or df.empty:
-        return None
-    for n in names:
-        if n in df.index:
-            return df.loc[n].sort_index().dropna()
-    return None
 
 
 def draw(s, label, kind, window, unit, note=None):
@@ -120,6 +121,133 @@ def draw(s, label, kind, window, unit, note=None):
         st.caption(note)
 
 
+# ---------- SEC EDGAR ----------
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def sec_ticker_map():
+    url = "https://www.sec.gov/files/company_tickers.json"
+    r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in data.values()}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def sec_company_facts(cik):
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    r = requests.get(url, headers=SEC_HEADERS, timeout=30)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+
+def _sec_rows(facts, tags, unit="USD"):
+    """בוחר מבין התגיות את זו עם הנתונים העדכניים ביותר."""
+    if not facts:
+        return None
+    gaap = facts.get("facts", {}).get("us-gaap", {})
+    best = None
+    for tag in tags:
+        if tag not in gaap:
+            continue
+        units = gaap[tag].get("units", {})
+        vals = units.get(unit)
+        if vals is None:
+            vals = next(iter(units.values()), None)
+        if not vals:
+            continue
+        rows = []
+        for v in vals:
+            if v.get("form") not in ("10-Q", "10-K") or not v.get("end"):
+                continue
+            rows.append({
+                "end": pd.to_datetime(v.get("end")),
+                "start": pd.to_datetime(v.get("start")),
+                "val": v.get("val"),
+                "filed": v.get("filed", ""),
+            })
+        if not rows:
+            continue
+        df = pd.DataFrame(rows).sort_values(["end", "start", "filed"])
+        if best is None or df["end"].max() > best["end"].max():
+            best = df
+    return best
+
+
+def sec_quarterly_series(facts, tags, unit="USD"):
+    """ערכים רבעוניים. רבעון 4 מחושב כשנה פחות שלושת הרבעונים הראשונים."""
+    df = _sec_rows(facts, tags, unit)
+    if df is None:
+        return None
+    df = df[df["start"].notna()]
+    dur = (df["end"] - df["start"]).dt.days
+
+    q = df[dur.between(70, 100)].drop_duplicates("end", keep="last")
+    q = q.set_index("end")["val"].sort_index()
+
+    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
+    extra = {}
+    for _, r in a.iterrows():
+        inside = q[(q.index > r["start"]) & (q.index < r["end"])]
+        if r["end"] not in q.index and len(inside) == 3:
+            extra[r["end"]] = r["val"] - inside.sum()
+    if extra:
+        q = pd.concat([q, pd.Series(extra)]).sort_index()
+    return q if not q.empty else None
+
+
+def sec_annual_series(facts, tags, unit="USD"):
+    df = _sec_rows(facts, tags, unit)
+    if df is None:
+        return None
+    df = df[df["start"].notna()]
+    dur = (df["end"] - df["start"]).dt.days
+    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
+    if a.empty:
+        return None
+    return a.set_index("end")["val"].sort_index()
+
+
+def sec_instant_series(facts, tags, unit="USD"):
+    df = _sec_rows(facts, tags, unit)
+    if df is None:
+        return None
+    df = df[df["start"].isna()].drop_duplicates("end", keep="last")
+    if df.empty:
+        return None
+    return df.set_index("end")["val"].sort_index()
+
+
+def sec_total_debt(facts):
+    s = sec_instant_series(facts, ["DebtLongtermAndShorttermCombinedAmount"])
+    if s is not None:
+        return s
+    lt = sec_instant_series(facts, ["LongTermDebtNoncurrent"])
+    sh = sec_instant_series(facts, ["LongTermDebtCurrent", "DebtCurrent"])
+    if lt is None and sh is None:
+        return None
+    if lt is None:
+        return sh
+    if sh is None:
+        return lt
+    return pd.concat([lt, sh], axis=1).fillna(0).sum(axis=1)
+
+
+def sec_fcf_annual(facts):
+    ocf = sec_annual_series(facts, OCF_TAGS)
+    capex = sec_annual_series(facts, CAPEX_TAGS)
+    if ocf is None or capex is None:
+        return None
+    df = pd.concat([ocf, capex], axis=1, keys=["ocf", "capex"]).dropna()
+    if df.empty:
+        return None
+    return df["ocf"] - df["capex"].abs()
+
+
+# ---------- yfinance ----------
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_tickers(q):
     try:
@@ -137,42 +265,29 @@ def search_tickers(q):
 def load(ticker):
     t = yf.Ticker(ticker)
     info = t.info or {}
-    qinc = t.quarterly_income_stmt
-    eps = None
-    try:
-        ed = t.get_earnings_dates(limit=16)
-        s = ed["Reported EPS"].dropna()
-        if s.index.tz is not None:
-            s.index = s.index.tz_localize(None)
-        s.index = s.index.normalize()
-        s = s.sort_index()
-        if len(s) >= 4:
-            eps = s
-    except Exception:
-        eps = None
-    if eps is None:
-        eps = row(qinc, ["Diluted EPS", "Basic EPS"])
     hist = t.history(period="6y")
     if hist.index.tz is not None:
         hist.index = hist.index.tz_localize(None)
-    return {
-        "info": info,
-        "qinc": qinc,
-        "inc": t.income_stmt,
-        "bal": t.balance_sheet,
-        "cf": t.cashflow,
-        "eps": eps,
-        "hist": hist,
-    }
+
+    facts = None
+    try:
+        cik = sec_ticker_map().get(ticker.upper())
+        if cik:
+            facts = sec_company_facts(cik)
+    except Exception:
+        facts = None
+
+    return {"info": info, "hist": hist, "facts": facts}
 
 
-def pe_series(eps, hist):
-    if eps is None or len(eps) < 4 or hist.empty:
+def pe_series(eps_q, hist):
+    """מכפיל TTM: מחיר בסוף הרבעון חלקי סכום EPS של 4 רבעונים."""
+    if eps_q is None or len(eps_q) < 4 or hist.empty:
         return None
-    ttm = eps.rolling(4).sum().dropna()
+    ttm = eps_q.rolling(4).sum().dropna()
     out = {}
     for d, e in ttm.items():
-        if e > 0:
+        if e and e > 0:
             px = hist["Close"][hist.index <= d]
             if not px.empty:
                 out[d] = px.iloc[-1] / e
@@ -207,20 +322,20 @@ with mid:
 
 ticker = st.session_state.ticker
 if not ticker:
-    st.info("חפש מנייה כדי להתחיל.")
+    st.info("חפש מנייה כדי להתחיל. הנתונים הפונדמנטליים מגיעים מ-SEC EDGAR, ולכן מכוסות חברות הרשומות בארה\"ב.")
     st.stop()
 
 with st.spinner(f"טוען נתונים עבור {ticker}..."):
     d = load(ticker)
 
-info, qinc, inc, bal, cf, eps, hist = (
-    d["info"], d["qinc"], d["inc"], d["bal"], d["cf"], d["eps"], d["hist"],
-)
+info, hist, facts = d["info"], d["hist"], d["facts"]
 if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
     st.error("לא הצלחתי למשוך נתונים לטיקר הזה.")
     st.stop()
 
-cur = info.get("currency", "")
+if facts is None:
+    st.warning("לא נמצאו נתוני SEC לטיקר הזה. ייתכן שזו חברה לא אמריקאית, או שה-API זמנית לא זמין.")
+
 employees = info.get("fullTimeEmployees")
 
 st.divider()
@@ -240,72 +355,80 @@ elif metric in ANNUAL:
 
 st.markdown(f"### {metric}")
 
+rev_q = sec_quarterly_series(facts, REV_TAGS) if facts else None
+ni_q = sec_quarterly_series(facts, NI_TAGS) if facts else None
+eps_q = sec_quarterly_series(facts, EPS_TAGS, "USD/shares") if facts else None
+rev_a = sec_annual_series(facts, REV_TAGS) if facts else None
+debt_i = sec_total_debt(facts) if facts else None
+fcf_a = sec_fcf_annual(facts) if facts else None
+
 # ---------- הגרפים ----------
 
 if metric == "הכנסות":
-    s = row(qinc, ["Total Revenue"])
-    if s is None:
-        st.warning("אין נתוני הכנסות רבעוניות.")
+    if rev_q is None:
+        st.warning("אין נתוני הכנסות רבעוניות מ-SEC לטיקר הזה.")
     else:
-        draw(s / 1e6, "הכנסות", "num", n, "רבעונים", f"במיליונים ({cur})")
+        if rev_q.abs().max() >= 1e9:
+            scale, unit_tag = 1e9, "B"
+        else:
+            scale, unit_tag = 1e6, "M"
+        draw(rev_q / scale, f"הכנסות ({unit_tag})", unit_tag, n, "רבעונים",
+             "B = מיליארדים, M = מיליונים. מקור: SEC EDGAR.")
 
 elif metric == "רווח למניה":
-    if eps is None or len(eps) == 0:
-        st.warning("אין נתוני רווח למניה.")
+    if eps_q is None:
+        st.warning("אין נתוני רווח למניה מ-SEC לטיקר הזה.")
     else:
-        draw(eps, "רווח למניה", "num", n, "רבעונים", "רווח למניה רבעוני כפי שדווח, לפי תאריך הדיווח")
+        draw(eps_q, "רווח למניה", "num", n, "רבעונים",
+             "רבעון 4 מחושב כרווח שנתי פחות שלושת הרבעונים הראשונים, ולכן הוא קירוב. מקור: SEC EDGAR.")
 
 elif metric == "שולי רווח נקי":
-    rev = row(qinc, ["Total Revenue"])
-    ni = row(qinc, ["Net Income"])
-    if rev is None or ni is None:
+    if rev_q is None or ni_q is None:
         st.warning("אין נתונים לחישוב שולי רווח נקי.")
     else:
-        s = (ni / rev * 100).dropna()
-        draw(s, "שולי רווח נקי", "pct", n, "רבעונים", "רווח נקי באחוזים מההכנסות")
+        df = pd.concat([ni_q, rev_q], axis=1, keys=["ni", "rev"]).dropna()
+        draw(df["ni"] / df["rev"] * 100, "שולי רווח נקי", "pct", n, "רבעונים",
+             "רווח נקי באחוזים מההכנסות. מקור: SEC EDGAR.")
 
 elif metric == "מכפיל רווח":
-    pe = pe_series(eps, hist)
+    pe = pe_series(eps_q, hist)
     if pe is None:
         st.warning("אין מספיק נתוני רווח למניה לחישוב מכפיל (נדרשים 4 רבעונים לפחות).")
     else:
         draw(pe, "מכפיל רווח", "x", n, "רבעונים",
-             "מחיר ביום הדיווח חלקי סכום רווח למניה של 4 רבעונים")
+             "מחיר בסוף הרבעון (yfinance) חלקי סכום רווח למניה של 4 רבעונים (SEC).")
 
 elif metric == "מכפיל רווח עתידי":
     fwd = info.get("forwardPE")
     m1, m2 = st.columns(2)
     m1.metric("מכפיל עתידי (הערכת אנליסטים)", fmt(fwd, "x"))
     m2.metric("מכפיל נוכחי", fmt(info.get("trailingPE"), "x"))
-    pe = pe_series(eps, hist)
+    pe = pe_series(eps_q, hist)
     if pe is not None:
         df = pd.DataFrame({"מכפיל היסטורי": pe})
         if fwd is not None and not pd.isna(fwd):
             df["מכפיל עתידי (נוכחי)"] = fwd
-        df.index = [d.strftime("%Y-%m") for d in df.index]
+        df.index = [dte.strftime("%Y-%m") for dte in df.index]
         st.line_chart(df)
-    st.caption("yfinance לא מספק היסטוריה של מכפיל עתידי. הקו השטוח הוא ערכו הנוכחי, להשוואה בלבד.")
+    st.caption("אין היסטוריה של מכפיל עתידי. הקו השטוח הוא ערכו הנוכחי, להשוואה בלבד. מקור: yfinance.")
 
 elif metric == "יחס חוב לתזרים (שנתי)":
-    debt = row(bal, ["Total Debt"])
-    fcf = row(cf, ["Free Cash Flow"])
-    if debt is None or fcf is None:
-        st.warning("אין נתוני חוב או תזרים חופשי שנתיים.")
+    if debt_i is None or fcf_a is None:
+        st.warning("אין נתוני חוב או תזרים חופשי שנתיים מ-SEC לטיקר הזה.")
     else:
-        df = pd.concat([debt, fcf], axis=1, keys=["debt", "fcf"]).dropna()
+        df = pd.concat([debt_i, fcf_a], axis=1, keys=["debt", "fcf"]).dropna()
         df = df[df["fcf"] > 0]
         if df.empty:
-            st.warning("התזרים החופשי שלילי בכל השנים הזמינות, ולכן היחס אינו בעל משמעות.")
+            st.warning("אין שנים עם תזרים חופשי חיובי ונתוני חוב תואמים, ולכן היחס אינו בעל משמעות.")
         else:
             draw(df["debt"] / df["fcf"], "חוב / תזרים חופשי", "x", n, "שנים",
-                 "חוב כולל חלקי תזרים חופשי: כמה שנות תזרים נדרשות כדי לפרוע את החוב. שנים עם תזרים שלילי לא מוצגות.")
+                 "חוב כולל חלקי תזרים חופשי (תזרים תפעולי פחות השקעות הוניות). מקור: SEC EDGAR.")
 
 elif metric == "הכנסה לעובד (שנתי)":
-    rev = row(inc, ["Total Revenue"])
-    if rev is None or not employees:
-        st.warning("אין נתוני הכנסות שנתיות או מספר עובדים.")
+    if rev_a is None or not employees:
+        st.warning("אין נתוני הכנסות שנתיות מ-SEC או מספר עובדים.")
     else:
-        draw(rev / employees, "הכנסה לעובד", "money", n, "שנים",
-             f"הכנסה שנתית חלקי מספר העובדים הנוכחי ({employees:,}). לשנים קודמות זה קירוב, כי אין היסטוריית עובדים.")
+        draw(rev_a / employees, "הכנסה לעובד", "money", n, "שנים",
+             f"הכנסה שנתית (SEC) חלקי מספר העובדים הנוכחי ({employees:,}, yfinance). לשנים קודמות זה קירוב.")
 
-st.caption("הנתונים מגיעים מ-yfinance (לא רשמי) ועשויים להיות חסרים או לא מדויקים. אין לראות בזה ייעוץ השקעות.")
+st.caption("נתונים פונדמנטליים מ-SEC EDGAR, מחיר ומכפיל עתידי מ-yfinance. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
