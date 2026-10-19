@@ -19,8 +19,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# SEC דורש זיהוי אמיתי. החלף לשם ולכתובת המייל שלך.
-SEC_HEADERS = {"Nadav": "nadavtshuva2@gmail.com"}
+# SEC דורש זיהוי אמיתי. החלף לשם ולכתובת המייל שלך (השאר את הפורמט: שם ואז מייל).
+SEC_HEADERS = {
+    "Nadav": "Nadav nadavtshuva2@gmail.com",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 METRICS = [
     "הכנסות",
@@ -33,6 +36,9 @@ METRICS = [
 ]
 QUARTERLY = {"הכנסות", "רווח למניה", "שולי רווח נקי", "מכפיל רווח"}
 ANNUAL = {"יחס חוב לתזרים (שנתי)", "הכנסה לעובד (שנתי)"}
+
+SHOW_Q = 16  # כמה רבעונים מוצגים בגרף
+SHOW_Y = 8   # כמה שנים מוצגות בגרף
 
 REV_TAGS = [
     "Revenues",
@@ -74,28 +80,28 @@ def fmt(v, kind="num"):
         return "—"
 
 
-def draw(s, label, kind, window, unit, note=None):
-    """גרף קווי עם קו ממוצע נע, כרטיסי סיכום וטבלה עם שינוי באחוזים."""
+def draw(s, label, kind, window, unit, show, note=None):
+    """גרף קווי עם ממוצע נע, כרטיסי סיכום וטבלה. החישובים על כל ההיסטוריה, התצוגה על האחרונים."""
     s = s.dropna()
     if s.empty:
         st.warning("אין נתונים להצגה.")
         return
 
     ma = s.rolling(window).mean()
-    avg_name = f"ממוצע נע ({window} {unit})"
-
     chg = (s.diff() / s.shift().abs() * 100).replace([np.inf, -np.inf], np.nan)
-    chg_name = "שינוי מהתקופה הקודמת (%)"
-    avg_chg_name = f"ממוצע שינוי (%) — {window - 1} שינויים"
     avg_chg = chg.rolling(window - 1).mean()
 
-    chart_df = pd.DataFrame({label: s, avg_name: ma})
+    avg_name = f"ממוצע נע ({window} {unit})"
+    chg_name = "שינוי מהתקופה הקודמת (%)"
+    avg_chg_name = f"ממוצע שינוי (%) — {window - 1} שינויים"
+
+    chart_df = pd.DataFrame({label: s, avg_name: ma}).tail(show)
     table_df = pd.DataFrame({
         label: s,
         avg_name: ma,
         chg_name: chg,
         avg_chg_name: avg_chg,
-    })
+    }).tail(show)
     chart_df.index = [d.strftime("%Y-%m") for d in chart_df.index]
     table_df.index = [d.strftime("%Y-%m") for d in table_df.index]
 
@@ -122,109 +128,125 @@ def draw(s, label, kind, window, unit, note=None):
 
 
 # ---------- SEC EDGAR ----------
+# הפונקציות עם המטמון זורקות שגיאה בכשל, ולכן כשלים לא נשמרים.
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def sec_ticker_map():
-    url = "https://www.sec.gov/files/company_tickers.json"
-    r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+    r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                     headers=SEC_HEADERS, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in data.values()}
+    return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def sec_company_facts(cik):
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    r = requests.get(url, headers=SEC_HEADERS, timeout=30)
-    if r.status_code != 200:
-        return None
+    r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                     headers=SEC_HEADERS, timeout=40)
+    r.raise_for_status()
     return r.json()
 
 
-def _sec_rows(facts, tags, unit="USD"):
-    """בוחר מבין התגיות את זו עם הנתונים העדכניים ביותר."""
-    if not facts:
-        return None
+def get_sec(ticker):
+    """מחזיר (נתונים, הודעת שגיאה)."""
+    try:
+        cik = sec_ticker_map().get(ticker.upper().replace(".", "-"))
+        if not cik:
+            return None, "הטיקר לא נמצא ברשימת SEC (ייתכן שזו חברה לא אמריקאית)"
+        return sec_company_facts(cik), None
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return None, f"SEC החזיר שגיאה {code}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _rows(facts, tag, unit):
     gaap = facts.get("facts", {}).get("us-gaap", {})
-    best = None
-    for tag in tags:
-        if tag not in gaap:
-            continue
-        units = gaap[tag].get("units", {})
-        vals = units.get(unit)
-        if vals is None:
-            vals = next(iter(units.values()), None)
-        if not vals:
-            continue
-        rows = []
-        for v in vals:
-            if v.get("form") not in ("10-Q", "10-K") or not v.get("end"):
-                continue
-            rows.append({
-                "end": pd.to_datetime(v.get("end")),
-                "start": pd.to_datetime(v.get("start")),
-                "val": v.get("val"),
-                "filed": v.get("filed", ""),
-            })
-        if not rows:
-            continue
-        df = pd.DataFrame(rows).sort_values(["end", "start", "filed"])
-        if best is None or df["end"].max() > best["end"].max():
-            best = df
-    return best
-
-
-def sec_quarterly_series(facts, tags, unit="USD"):
-    """ערכים רבעוניים. רבעון 4 מחושב כשנה פחות שלושת הרבעונים הראשונים."""
-    df = _sec_rows(facts, tags, unit)
-    if df is None:
+    if tag not in gaap:
         return None
+    vals = gaap[tag].get("units", {}).get(unit)
+    if not vals:
+        return None
+    rows = [
+        {
+            "end": pd.to_datetime(v.get("end")),
+            "start": pd.to_datetime(v.get("start")),
+            "val": v.get("val"),
+            "filed": v.get("filed", ""),
+        }
+        for v in vals
+        if v.get("form") in ("10-Q", "10-K") and v.get("end")
+    ]
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values(["end", "start", "filed"])
+
+
+def _merge(series_list):
+    """מאחד סדרות מכמה תגיות: הסדרה העדכנית ביותר קודמת, האחרות ממלאות חורים."""
+    series_list = [s for s in series_list if s is not None and not s.empty]
+    if not series_list:
+        return None
+    series_list.sort(key=lambda s: s.index.max(), reverse=True)
+    out = series_list[0]
+    for s in series_list[1:]:
+        out = out.combine_first(s)
+    return out.sort_index()
+
+
+def _quarterly(df):
     df = df[df["start"].notna()]
+    if df.empty:
+        return None
     dur = (df["end"] - df["start"]).dt.days
-
-    q = df[dur.between(70, 100)].drop_duplicates("end", keep="last")
-    q = q.set_index("end")["val"].sort_index()
-
+    q = (df[dur.between(70, 100)].drop_duplicates("end", keep="last")
+         .set_index("end")["val"].sort_index())
     a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
     extra = {}
     for _, r in a.iterrows():
+        if r["end"] in q.index:
+            continue
         inside = q[(q.index > r["start"]) & (q.index < r["end"])]
-        if r["end"] not in q.index and len(inside) == 3:
+        if len(inside) == 3:
             extra[r["end"]] = r["val"] - inside.sum()
     if extra:
         q = pd.concat([q, pd.Series(extra)]).sort_index()
     return q if not q.empty else None
 
 
-def sec_annual_series(facts, tags, unit="USD"):
-    df = _sec_rows(facts, tags, unit)
-    if df is None:
-        return None
+def _annual(df):
     df = df[df["start"].notna()]
-    dur = (df["end"] - df["start"]).dt.days
-    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
-    if a.empty:
-        return None
-    return a.set_index("end")["val"].sort_index()
-
-
-def sec_instant_series(facts, tags, unit="USD"):
-    df = _sec_rows(facts, tags, unit)
-    if df is None:
-        return None
-    df = df[df["start"].isna()].drop_duplicates("end", keep="last")
     if df.empty:
         return None
-    return df.set_index("end")["val"].sort_index()
+    dur = (df["end"] - df["start"]).dt.days
+    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
+    return a.set_index("end")["val"].sort_index() if not a.empty else None
+
+
+def _instant(df):
+    df = df[df["start"].isna()].drop_duplicates("end", keep="last")
+    return df.set_index("end")["val"].sort_index() if not df.empty else None
+
+
+def sec_series(facts, tags, kind, unit="USD"):
+    if not facts:
+        return None
+    fn = {"q": _quarterly, "a": _annual, "i": _instant}[kind]
+    out = []
+    for tag in tags:
+        df = _rows(facts, tag, unit)
+        if df is not None:
+            out.append(fn(df))
+    return _merge(out)
 
 
 def sec_total_debt(facts):
-    s = sec_instant_series(facts, ["DebtLongtermAndShorttermCombinedAmount"])
+    s = sec_series(facts, ["DebtLongtermAndShorttermCombinedAmount"], "i")
     if s is not None:
         return s
-    lt = sec_instant_series(facts, ["LongTermDebtNoncurrent"])
-    sh = sec_instant_series(facts, ["LongTermDebtCurrent", "DebtCurrent"])
+    lt = sec_series(facts, ["LongTermDebtNoncurrent"], "i")
+    sh = sec_series(facts, ["LongTermDebtCurrent", "DebtCurrent"], "i")
     if lt is None and sh is None:
         return None
     if lt is None:
@@ -235,8 +257,8 @@ def sec_total_debt(facts):
 
 
 def sec_fcf_annual(facts):
-    ocf = sec_annual_series(facts, OCF_TAGS)
-    capex = sec_annual_series(facts, CAPEX_TAGS)
+    ocf = sec_series(facts, OCF_TAGS, "a")
+    capex = sec_series(facts, CAPEX_TAGS, "a")
     if ocf is None or capex is None:
         return None
     df = pd.concat([ocf, capex], axis=1, keys=["ocf", "capex"]).dropna()
@@ -262,22 +284,13 @@ def search_tickers(q):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load(ticker):
+def load_market(ticker):
     t = yf.Ticker(ticker)
     info = t.info or {}
-    hist = t.history(period="6y")
+    hist = t.history(period="max")
     if hist.index.tz is not None:
         hist.index = hist.index.tz_localize(None)
-
-    facts = None
-    try:
-        cik = sec_ticker_map().get(ticker.upper())
-        if cik:
-            facts = sec_company_facts(cik)
-    except Exception:
-        facts = None
-
-    return {"info": info, "hist": hist, "facts": facts}
+    return info, hist
 
 
 def pe_series(eps_q, hist):
@@ -326,15 +339,15 @@ if not ticker:
     st.stop()
 
 with st.spinner(f"טוען נתונים עבור {ticker}..."):
-    d = load(ticker)
+    info, hist = load_market(ticker)
+    facts, sec_err = get_sec(ticker)
 
-info, hist, facts = d["info"], d["hist"], d["facts"]
 if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
-    st.error("לא הצלחתי למשוך נתונים לטיקר הזה.")
+    st.error("לא הצלחתי למשוך נתוני מחיר לטיקר הזה.")
     st.stop()
 
 if facts is None:
-    st.warning("לא נמצאו נתוני SEC לטיקר הזה. ייתכן שזו חברה לא אמריקאית, או שה-API זמנית לא זמין.")
+    st.warning(f"לא נמצאו נתוני SEC לטיקר הזה. סיבה: {sec_err}")
 
 employees = info.get("fullTimeEmployees")
 
@@ -351,16 +364,16 @@ n = 4
 if metric in QUARTERLY:
     n = st.slider("ממוצע נע (מספר רבעונים)", 2, 8, 4)
 elif metric in ANNUAL:
-    n = st.slider("ממוצע נע (מספר שנים)", 2, 4, 2)
+    n = st.slider("ממוצע נע (מספר שנים)", 2, 5, 2)
 
 st.markdown(f"### {metric}")
 
-rev_q = sec_quarterly_series(facts, REV_TAGS) if facts else None
-ni_q = sec_quarterly_series(facts, NI_TAGS) if facts else None
-eps_q = sec_quarterly_series(facts, EPS_TAGS, "USD/shares") if facts else None
-rev_a = sec_annual_series(facts, REV_TAGS) if facts else None
-debt_i = sec_total_debt(facts) if facts else None
-fcf_a = sec_fcf_annual(facts) if facts else None
+rev_q = sec_series(facts, REV_TAGS, "q")
+ni_q = sec_series(facts, NI_TAGS, "q")
+eps_q = sec_series(facts, EPS_TAGS, "q", "USD/shares")
+rev_a = sec_series(facts, REV_TAGS, "a")
+debt_i = sec_total_debt(facts)
+fcf_a = sec_fcf_annual(facts)
 
 # ---------- הגרפים ----------
 
@@ -368,18 +381,18 @@ if metric == "הכנסות":
     if rev_q is None:
         st.warning("אין נתוני הכנסות רבעוניות מ-SEC לטיקר הזה.")
     else:
-        if rev_q.abs().max() >= 1e9:
-            scale, unit_tag = 1e9, "B"
+        if rev_q.tail(SHOW_Q).abs().max() >= 1e9:
+            scale, tag = 1e9, "B"
         else:
-            scale, unit_tag = 1e6, "M"
-        draw(rev_q / scale, f"הכנסות ({unit_tag})", unit_tag, n, "רבעונים",
+            scale, tag = 1e6, "M"
+        draw(rev_q / scale, f"הכנסות ({tag})", tag, n, "רבעונים", SHOW_Q,
              "B = מיליארדים, M = מיליונים. מקור: SEC EDGAR.")
 
 elif metric == "רווח למניה":
     if eps_q is None:
         st.warning("אין נתוני רווח למניה מ-SEC לטיקר הזה.")
     else:
-        draw(eps_q, "רווח למניה", "num", n, "רבעונים",
+        draw(eps_q, "רווח למניה", "num", n, "רבעונים", SHOW_Q,
              "רבעון 4 מחושב כרווח שנתי פחות שלושת הרבעונים הראשונים, ולכן הוא קירוב. מקור: SEC EDGAR.")
 
 elif metric == "שולי רווח נקי":
@@ -387,7 +400,7 @@ elif metric == "שולי רווח נקי":
         st.warning("אין נתונים לחישוב שולי רווח נקי.")
     else:
         df = pd.concat([ni_q, rev_q], axis=1, keys=["ni", "rev"]).dropna()
-        draw(df["ni"] / df["rev"] * 100, "שולי רווח נקי", "pct", n, "רבעונים",
+        draw(df["ni"] / df["rev"] * 100, "שולי רווח נקי", "pct", n, "רבעונים", SHOW_Q,
              "רווח נקי באחוזים מההכנסות. מקור: SEC EDGAR.")
 
 elif metric == "מכפיל רווח":
@@ -395,7 +408,7 @@ elif metric == "מכפיל רווח":
     if pe is None:
         st.warning("אין מספיק נתוני רווח למניה לחישוב מכפיל (נדרשים 4 רבעונים לפחות).")
     else:
-        draw(pe, "מכפיל רווח", "x", n, "רבעונים",
+        draw(pe, "מכפיל רווח", "x", n, "רבעונים", SHOW_Q,
              "מחיר בסוף הרבעון (yfinance) חלקי סכום רווח למניה של 4 רבעונים (SEC).")
 
 elif metric == "מכפיל רווח עתידי":
@@ -405,7 +418,7 @@ elif metric == "מכפיל רווח עתידי":
     m2.metric("מכפיל נוכחי", fmt(info.get("trailingPE"), "x"))
     pe = pe_series(eps_q, hist)
     if pe is not None:
-        df = pd.DataFrame({"מכפיל היסטורי": pe})
+        df = pd.DataFrame({"מכפיל היסטורי": pe}).tail(SHOW_Q)
         if fwd is not None and not pd.isna(fwd):
             df["מכפיל עתידי (נוכחי)"] = fwd
         df.index = [dte.strftime("%Y-%m") for dte in df.index]
@@ -421,14 +434,14 @@ elif metric == "יחס חוב לתזרים (שנתי)":
         if df.empty:
             st.warning("אין שנים עם תזרים חופשי חיובי ונתוני חוב תואמים, ולכן היחס אינו בעל משמעות.")
         else:
-            draw(df["debt"] / df["fcf"], "חוב / תזרים חופשי", "x", n, "שנים",
+            draw(df["debt"] / df["fcf"], "חוב / תזרים חופשי", "x", n, "שנים", SHOW_Y,
                  "חוב כולל חלקי תזרים חופשי (תזרים תפעולי פחות השקעות הוניות). מקור: SEC EDGAR.")
 
 elif metric == "הכנסה לעובד (שנתי)":
     if rev_a is None or not employees:
         st.warning("אין נתוני הכנסות שנתיות מ-SEC או מספר עובדים.")
     else:
-        draw(rev_a / employees, "הכנסה לעובד", "money", n, "שנים",
+        draw(rev_a / employees, "הכנסה לעובד", "money", n, "שנים", SHOW_Y,
              f"הכנסה שנתית (SEC) חלקי מספר העובדים הנוכחי ({employees:,}, yfinance). לשנים קודמות זה קירוב.")
 
 st.caption("נתונים פונדמנטליים מ-SEC EDGAR, מחיר ומכפיל עתידי מ-yfinance. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
