@@ -5,8 +5,10 @@ import yfinance as yf
 
 try:
     from tvscreener import get_financials
-except Exception:
+    TV_IMPORT_ERR = None
+except Exception as _e:
     get_financials = None
+    TV_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
 
 st.set_page_config(page_title="מנתח מניות", page_icon="🔍", layout="wide")
 
@@ -40,9 +42,15 @@ SHOW_Y = 8
 EXCHANGES = ["NASDAQ", "NYSE", "AMEX"]
 
 REV_OPTS = [["total revenue"], ["revenue"]]
+REV_EXC = ("growth", "%", "per share", "cost", "margin", "ratio")
 NI_OPTS = [["net income"]]
-NI_EXCLUDE = ("per share", "before", "margin", "%", "growth", "discontinued")
+NI_EXC = ("per share", "before", "margin", "%", "growth", "discontinued")
 EPS_OPTS = [["diluted", "eps"], ["diluted", "earnings per share"], ["eps"], ["earnings per share"]]
+EPS_EXC = ("growth", "%", "estimate", "surprise")
+DEBT_OPTS = [["total debt"]]
+DEBT_EXC = ("ratio", "%", "net", "growth", "/")
+FCF_OPTS = [["free cash flow"]]
+FCF_EXC = ("margin", "%", "per share", "growth", "ratio", "yield")
 
 
 # ---------- עזרים ----------
@@ -87,6 +95,32 @@ def row(df, names):
         if n in df.index:
             return df.loc[n].sort_index().dropna()
     return None
+
+
+def by_year(s):
+    if s is None or s.empty:
+        return None
+    if isinstance(s.index, pd.DatetimeIndex):
+        s = s.groupby(s.index.year).last()
+    return s
+
+
+def col_series(df, options, exclude=()):
+    for words in options:
+        for c in df.columns:
+            n = str(c).lower()
+            if all(k in n for k in words) and not any(x in n for x in exclude):
+                s = pd.to_numeric(df[c], errors="coerce").dropna()
+                if not s.empty:
+                    return s
+    return None
+
+
+def to_usd(s):
+    """אם הערכים קטנים מאוד, מניחים שהם במיליונים."""
+    if s is not None and not s.empty and s.abs().max() < 1e6:
+        return s * 1e6
+    return s
 
 
 def draw(s, label, kind, window, unit, show, note=None):
@@ -136,24 +170,21 @@ def draw(s, label, kind, window, unit, show, note=None):
         st.caption(note)
 
 
-# ---------- TradingView ----------
+# ---------- טעינה עמידה לכשלים ----------
+# הפונקציות עם המטמון זורקות שגיאה בכשל, ולכן כשלים לא נשמרים במטמון הכללי.
+# get() שומר גם כשלים בסשן, כדי שלא נפנה שוב ושוב למקור חסום בכל לחיצה.
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def tv_income_quarterly(ticker):
-    """דוח רווח והפסד רבעוני מ-TradingView. זורק שגיאה בכשל, ולכן כשלים לא נשמרים במטמון."""
-    if get_financials is None:
-        raise RuntimeError("ספריית tvscreener לא מותקנת")
-    sym = ticker.upper().replace("-", ".")
-    last = None
-    for ex in EXCHANGES:
+def get(key, fn):
+    store = st.session_state.setdefault("store", {})
+    k = (st.session_state.get("ticker"), key)
+    if k not in store:
         try:
-            df = get_financials(f"{ex}:{sym}", "income_statement", "FQ")
-            if df is not None and len(df) > 0:
-                return df
+            store[k] = ("ok", fn())
         except Exception as e:
-            last = e
-    raise RuntimeError(f"TradingView לא החזיר נתונים ({type(last).__name__ if last else 'ריק'})")
+            store[k] = ("err", f"{type(e).__name__}: {str(e)[:200]}")
+    status, val = store[k]
+    return (val, None) if status == "ok" else (None, val)
 
 
 def tv_prepare(df):
@@ -175,61 +206,90 @@ def tv_prepare(df):
     return df
 
 
-def col_series(df, options, exclude=()):
-    for inc_words in options:
-        for c in df.columns:
-            n = str(c).lower()
-            if all(k in n for k in inc_words) and not any(x in n for x in exclude):
-                s = pd.to_numeric(df[c], errors="coerce").dropna()
-                if not s.empty:
-                    return s
-    return None
-
-
-def to_usd(s):
-    """אם הערכים קטנים מאוד, מניחים שהם במיליונים."""
-    if s is not None and not s.empty and s.abs().max() < 1e6:
-        return s * 1e6
-    return s
-
-
-# ---------- yfinance ----------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_tv(ticker, stmt, period):
+    if get_financials is None:
+        raise RuntimeError(f"ספריית tvscreener לא נטענה: {TV_IMPORT_ERR}")
+    sym = ticker.upper().replace("-", ".")
+    last = None
+    for ex in EXCHANGES:
+        try:
+            df = get_financials(f"{ex}:{sym}", stmt, period)
+            if df is not None and len(df) > 0:
+                return tv_prepare(df)
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"TradingView לא החזיר נתונים ({type(last).__name__ if last else 'ריק'})")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_hist(ticker):
+    h = yf.Ticker(ticker).history(period="max")
+    if h is None or h.empty:
+        raise RuntimeError("Yahoo לא החזיר היסטוריית מחירים")
+    if h.index.tz is not None:
+        h.index = h.index.tz_localize(None)
+    return h
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_info(ticker):
+    info = yf.Ticker(ticker).info
+    if not info or len(info) < 5:
+        raise RuntimeError("Yahoo לא החזיר פרטי חברה")
+    return info
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fast(ticker):
+    fi = yf.Ticker(ticker).fast_info
+    out = {}
+    for k_out, k_in in (("price", "last_price"), ("market_cap", "market_cap")):
+        try:
+            out[k_out] = fi[k_in]
+        except Exception:
+            out[k_out] = None
+    if out["price"] is None and out["market_cap"] is None:
+        raise RuntimeError("fast_info ריק")
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_yf_stmt(ticker, kind):
+    names = {
+        "qinc": "quarterly_income_stmt",
+        "inc": "income_stmt",
+        "bal": "balance_sheet",
+        "cf": "cashflow",
+    }
+    df = getattr(yf.Ticker(ticker), names[kind])
+    if df is None or df.empty:
+        raise RuntimeError("Yahoo לא החזיר דוחות")
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _search(q):
+    res = yf.Search(q, max_results=8).quotes
+    return [
+        (r.get("symbol"), r.get("shortname") or r.get("longname") or "", r.get("exchDisp", ""))
+        for r in res
+        if r.get("quoteType") in ("EQUITY", "ETF")
+    ]
+
+
 def search_tickers(q):
     try:
-        res = yf.Search(q, max_results=8).quotes
-        return [
-            (r.get("symbol"), r.get("shortname") or r.get("longname") or "", r.get("exchDisp", ""))
-            for r in res
-            if r.get("quoteType") in ("EQUITY", "ETF")
-        ]
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_market(ticker):
-    t = yf.Ticker(ticker)
-    info = t.info or {}
-    hist = t.history(period="max")
-    if hist.index.tz is not None:
-        hist.index = hist.index.tz_localize(None)
-    return {
-        "info": info,
-        "hist": hist,
-        "qinc": t.quarterly_income_stmt,
-        "inc": t.income_stmt,
-        "bal": t.balance_sheet,
-        "cf": t.cashflow,
-    }
+        return _search(q), None
+    except Exception as e:
+        return [], f"{type(e).__name__}"
 
 
 def pe_series(eps_q, hist):
     """מכפיל TTM: מחיר בסוף הרבעון חלקי סכום EPS של 4 רבעונים."""
     try:
-        if eps_q is None or len(eps_q) < 4 or hist.empty:
+        if (eps_q is None or hist is None or len(eps_q) < 4 or hist.empty
+                or not isinstance(eps_q.index, pd.DatetimeIndex)):
             return None
         ttm = eps_q.rolling(4).sum().dropna()
         out = {}
@@ -258,63 +318,91 @@ with mid:
         label_visibility="collapsed",
     )
     if query:
-        results = search_tickers(query)
-        if not results:
-            st.warning("לא נמצאו תוצאות. נסה טיקר מדויק.")
-            if st.button(f"נסה בכל זאת: {query.upper()}"):
-                st.session_state.ticker = query.upper()
-        else:
+        results, s_err = search_tickers(query)
+        if results:
             labels = [f"{s} — {n} ({e})" for s, n, e in results]
             choice = st.selectbox("תוצאות", labels, label_visibility="collapsed")
             if st.button("הצג נתונים", type="primary", use_container_width=True):
                 st.session_state.ticker = results[labels.index(choice)][0]
+        else:
+            msg = "לא נמצאו תוצאות בחיפוש."
+            if s_err:
+                msg = f"החיפוש של Yahoo לא זמין כרגע ({s_err})."
+            st.warning(msg + " אפשר להשתמש בטיקר ישירות.")
+        if st.button(f"השתמש בטיקר {query.strip().upper()} ישירות", use_container_width=True):
+            st.session_state.ticker = query.strip().upper()
 
 ticker = st.session_state.ticker
 if not ticker:
     st.info("חפש מנייה כדי להתחיל.")
     st.stop()
 
-with st.spinner(f"טוען נתונים עבור {ticker}..."):
-    m = load_market(ticker)
-    tv_err, tvdf = None, None
-    try:
-        tvdf = tv_prepare(tv_income_quarterly(ticker))
-    except Exception as e:
-        tv_err = str(e)
+# ---------- טעינת הנתונים ----------
 
-info, hist = m["info"], m["hist"]
-if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
-    st.error("לא הצלחתי למשוך נתוני מחיר לטיקר הזה.")
-    st.stop()
+with st.spinner(f"טוען נתונים עבור {ticker}..."):
+    hist, hist_err = get("hist", lambda: load_hist(ticker))
+    info, info_err = get("info", lambda: load_info(ticker))
+    fast = None
+    if info is None:
+        fast, _ = get("fast", lambda: load_fast(ticker))
+    tv_q, tv_q_err = get("tv_q", lambda: load_tv(ticker, "income_statement", "FQ"))
+
+info = info or {}
 
 # ---------- נתונים רבעוניים: TradingView, ואם חסר אז yfinance ----------
 
 src = {}
 rev_q = ni_q = eps_q = None
-if tvdf is not None:
-    rev_q = to_usd(col_series(tvdf, REV_OPTS))
-    ni_q = to_usd(col_series(tvdf, NI_OPTS, NI_EXCLUDE))
-    eps_q = col_series(tvdf, EPS_OPTS)
-    src = {"rev": "TradingView", "ni": "TradingView", "eps": "TradingView"}
+if tv_q is not None:
+    rev_q = to_usd(col_series(tv_q, REV_OPTS, REV_EXC))
+    ni_q = to_usd(col_series(tv_q, NI_OPTS, NI_EXC))
+    eps_q = col_series(tv_q, EPS_OPTS, EPS_EXC)
+    if rev_q is not None:
+        src["rev"] = "TradingView"
+    if ni_q is not None:
+        src["ni"] = "TradingView"
+    if eps_q is not None:
+        src["eps"] = "TradingView"
 
-if rev_q is None:
-    rev_q, src["rev"] = row(m["qinc"], ["Total Revenue"]), "yfinance"
-if ni_q is None:
-    ni_q, src["ni"] = row(m["qinc"], ["Net Income"]), "yfinance"
-if eps_q is None:
-    eps_q, src["eps"] = row(m["qinc"], ["Diluted EPS", "Basic EPS"]), "yfinance"
+if rev_q is None or ni_q is None or eps_q is None:
+    qinc, _ = get("yf_qinc", lambda: load_yf_stmt(ticker, "qinc"))
+    if qinc is not None:
+        if rev_q is None:
+            rev_q = row(qinc, ["Total Revenue"])
+            src["rev"] = "yfinance (עד 5 רבעונים)"
+        if ni_q is None:
+            ni_q = row(qinc, ["Net Income"])
+            src["ni"] = "yfinance (עד 5 רבעונים)"
+        if eps_q is None:
+            eps_q = row(qinc, ["Diluted EPS", "Basic EPS"])
+            src["eps"] = "yfinance (עד 5 רבעונים)"
 
-if tv_err:
-    st.warning(f"TradingView לא זמין כרגע: {tv_err}. מוצגים נתוני yfinance (עד 5 רבעונים).")
+# ---------- כותרת המנייה ----------
 
+price = info.get("currentPrice") or info.get("regularMarketPrice")
+if price is None and fast:
+    price = fast.get("price")
+if price is None and hist is not None:
+    price = float(hist["Close"].iloc[-1])
+mcap = info.get("marketCap") or (fast.get("market_cap") if fast else None)
 employees = info.get("fullTimeEmployees")
+
+if price is None and rev_q is None and eps_q is None:
+    st.error("לא הצלחתי למשוך נתונים לטיקר הזה משום מקור. פתח את 'מצב המקורות' למטה לפרטים.")
 
 st.divider()
 st.subheader(f"{info.get('longName', ticker)} ({ticker})")
 c1, c2, c3 = st.columns(3)
-c1.metric("מחיר", fmt(info.get("currentPrice") or info.get("regularMarketPrice")))
-c2.metric("שווי שוק", fmt(info.get("marketCap"), "money"))
+c1.metric("מחיר", fmt(price))
+c2.metric("שווי שוק", fmt(mcap, "money"))
 c3.metric("עובדים", fmt(employees, "money"))
+
+if info_err and fast is None and hist is None:
+    st.warning("Yahoo חוסם כרגע את האפליקציה, ולכן מחיר, שווי שוק ומספר עובדים חסרים. נתוני TradingView מוצגים כרגיל.")
+elif info_err:
+    st.caption("חלק מהנתונים של Yahoo (שווי שוק, עובדים, מכפילים) לא זמינים כרגע.")
+
+# ---------- בחירת נתון ----------
 
 metric = st.radio("בחר נתון", METRICS, horizontal=True)
 
@@ -322,9 +410,15 @@ n = 4
 if metric in QUARTERLY:
     n = st.slider("ממוצע נע (מספר רבעונים)", 2, 8, 4)
 elif metric in ANNUAL:
-    n = st.slider("ממוצע נע (מספר שנים)", 2, 4, 2)
+    n = st.slider("ממוצע נע (מספר שנים)", 2, 5, 2)
 
 st.markdown(f"### {metric}")
+
+cur_pe = info.get("trailingPE")
+if cur_pe is None and price is not None and eps_q is not None and len(eps_q) >= 4:
+    ttm_eps = eps_q.tail(4).sum()
+    if ttm_eps and ttm_eps > 0:
+        cur_pe = price / ttm_eps
 
 # ---------- הגרפים ----------
 
@@ -337,36 +431,38 @@ if metric == "הכנסות":
         else:
             scale, tag = 1e6, "M"
         draw(rev_q / scale, f"הכנסות ({tag})", tag, n, "רבעונים", SHOW_Q,
-             f"B = מיליארדים, M = מיליונים. מקור: {src['rev']}.")
+             f"B = מיליארדים, M = מיליונים. מקור: {src.get('rev', '—')}.")
 
 elif metric == "רווח למניה":
     if eps_q is None:
         st.warning("אין נתוני רווח למניה לטיקר הזה.")
     else:
-        draw(eps_q, "רווח למניה", "num", n, "רבעונים", SHOW_Q, f"מקור: {src['eps']}.")
+        draw(eps_q, "רווח למניה", "num", n, "רבעונים", SHOW_Q, f"מקור: {src.get('eps', '—')}.")
 
 elif metric == "שולי רווח נקי":
     if rev_q is None or ni_q is None:
         st.warning("אין נתונים לחישוב שולי רווח נקי.")
     else:
-        df = pd.concat([ni_q, rev_q], axis=1, keys=["ni", "rev"]).dropna()
+        df = pd.concat([to_usd(ni_q), to_usd(rev_q)], axis=1, keys=["ni", "rev"]).dropna()
         draw(df["ni"] / df["rev"] * 100, "שולי רווח נקי", "pct", n, "רבעונים", SHOW_Q,
-             f"רווח נקי באחוזים מההכנסות. מקור: {src['ni']}.")
+             f"רווח נקי באחוזים מההכנסות. מקור: {src.get('ni', '—')}.")
 
 elif metric == "מכפיל רווח":
-    st.metric("מכפיל רווח נוכחי (yfinance)", fmt(info.get("trailingPE"), "x"))
+    st.metric("מכפיל רווח נוכחי", fmt(cur_pe, "x"))
     pe = pe_series(eps_q, hist)
     if pe is None:
-        st.warning("אין מספיק נתוני רווח למניה לחישוב מכפיל היסטורי (נדרשים 4 רבעונים לפחות).")
+        st.warning("אין מספיק נתונים למכפיל היסטורי: נדרשים 4 רבעונים של רווח למניה והיסטוריית מחירים (Yahoo).")
     else:
         draw(pe, "מכפיל רווח", "x", n, "רבעונים", SHOW_Q,
-             f"מחיר בסוף הרבעון (yfinance) חלקי סכום רווח למניה של 4 רבעונים ({src['eps']}).")
+             f"מחיר בסוף הרבעון (Yahoo) חלקי סכום רווח למניה של 4 רבעונים ({src.get('eps', '—')}).")
 
 elif metric == "מכפיל רווח עתידי":
     fwd = info.get("forwardPE")
     m1, m2 = st.columns(2)
     m1.metric("מכפיל עתידי (הערכת אנליסטים)", fmt(fwd, "x"))
-    m2.metric("מכפיל נוכחי", fmt(info.get("trailingPE"), "x"))
+    m2.metric("מכפיל נוכחי", fmt(cur_pe, "x"))
+    if fwd is None:
+        st.warning("המכפיל העתידי מגיע רק מ-Yahoo, והוא לא זמין כרגע.")
     pe = pe_series(eps_q, hist)
     if pe is not None:
         df = pd.DataFrame({"מכפיל היסטורי": pe}).tail(SHOW_Q)
@@ -374,33 +470,77 @@ elif metric == "מכפיל רווח עתידי":
             df["מכפיל עתידי (נוכחי)"] = fwd
         df.index = [lab(d) for d in df.index]
         st.line_chart(df)
-    st.caption("אין היסטוריה של מכפיל עתידי. הקו השטוח הוא ערכו הנוכחי, להשוואה בלבד. מקור: yfinance.")
+    st.caption("אין היסטוריה של מכפיל עתידי. הקו השטוח הוא ערכו הנוכחי, להשוואה בלבד.")
 
 elif metric == "יחס חוב לתזרים (שנתי)":
-    debt = row(m["bal"], ["Total Debt"])
-    fcf = row(m["cf"], ["Free Cash Flow"])
+    debt = fcf = None
+    d_src = "TradingView"
+    bs, _ = get("tv_bs", lambda: load_tv(ticker, "balance_sheet", "FY"))
+    cfs, _ = get("tv_cf", lambda: load_tv(ticker, "cash_flow", "FY"))
+    if bs is not None:
+        debt = by_year(col_series(bs, DEBT_OPTS, DEBT_EXC))
+    if cfs is not None:
+        fcf = by_year(col_series(cfs, FCF_OPTS, FCF_EXC))
     if debt is None or fcf is None:
-        st.warning("אין נתוני חוב או תזרים חופשי שנתיים.")
+        # משתמשים ב-yfinance לשניהם יחד, כדי שהיחידות יהיו עקביות
+        bal, _ = get("yf_bal", lambda: load_yf_stmt(ticker, "bal"))
+        cf, _ = get("yf_cf", lambda: load_yf_stmt(ticker, "cf"))
+        debt = by_year(row(bal, ["Total Debt"])) if bal is not None else None
+        fcf = by_year(row(cf, ["Free Cash Flow"])) if cf is not None else None
+        d_src = "yfinance"
+    if debt is None or fcf is None:
+        st.warning("אין נתוני חוב או תזרים חופשי שנתיים לטיקר הזה.")
     else:
         df = pd.concat([debt, fcf], axis=1, keys=["debt", "fcf"]).dropna()
         df = df[df["fcf"] > 0]
         if df.empty:
-            st.warning("התזרים החופשי שלילי בכל השנים הזמינות, ולכן היחס אינו בעל משמעות.")
+            st.warning("אין שנים עם תזרים חופשי חיובי ונתוני חוב תואמים, ולכן היחס אינו בעל משמעות.")
         else:
             draw(df["debt"] / df["fcf"], "חוב / תזרים חופשי", "x", n, "שנים", SHOW_Y,
-                 "חוב כולל חלקי תזרים חופשי. שנים עם תזרים שלילי לא מוצגות. מקור: yfinance.")
+                 f"חוב כולל חלקי תזרים חופשי. שנים עם תזרים שלילי לא מוצגות. מקור: {d_src}.")
 
 elif metric == "הכנסה לעובד (שנתי)":
-    rev_a = row(m["inc"], ["Total Revenue"])
-    if rev_a is None or not employees:
-        st.warning("אין נתוני הכנסות שנתיות או מספר עובדים.")
+    rev_a, r_src = None, "TradingView"
+    inc_tv, _ = get("tv_inc_fy", lambda: load_tv(ticker, "income_statement", "FY"))
+    if inc_tv is not None:
+        rev_a = by_year(to_usd(col_series(inc_tv, REV_OPTS, REV_EXC)))
+    if rev_a is None:
+        inc_yf, _ = get("yf_inc", lambda: load_yf_stmt(ticker, "inc"))
+        if inc_yf is not None:
+            rev_a = by_year(row(inc_yf, ["Total Revenue"]))
+            r_src = "yfinance"
+    emp = employees
+    if not emp:
+        st.info("מספר העובדים מגיע מ-Yahoo ולא זמין כרגע. אפשר להזין אותו ידנית.")
+        manual = st.number_input("מספר עובדים", min_value=0, value=0, step=1000)
+        emp = manual or None
+    if rev_a is None:
+        st.warning("אין נתוני הכנסות שנתיות לטיקר הזה.")
+    elif not emp:
+        st.warning("חסר מספר עובדים.")
     else:
-        draw(rev_a / employees, "הכנסה לעובד", "money", n, "שנים", SHOW_Y,
-             f"הכנסה שנתית חלקי מספר העובדים הנוכחי ({employees:,}). לשנים קודמות זה קירוב. מקור: yfinance.")
+        draw(rev_a / emp, "הכנסה לעובד", "money", n, "שנים", SHOW_Y,
+             f"הכנסה שנתית ({r_src}) חלקי מספר העובדים הנוכחי ({int(emp):,}). לשנים קודמות זה קירוב.")
 
-if tvdf is not None:
-    with st.expander("מידע טכני: העמודות שהתקבלו מ-TradingView"):
-        st.write(list(tvdf.columns))
-        st.write(f"מקורות בשימוש: {src}")
+# ---------- אבחון ----------
 
-st.caption("הכנסות, רווח למניה ושולי רווח נקי מ-TradingView (ואם לא זמין, yfinance). שאר הנתונים מ-yfinance. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
+with st.expander("מצב המקורות (לאבחון תקלות)"):
+    store = st.session_state.get("store", {})
+    rows = [
+        {"נתון": k[1], "מצב": "תקין" if v[0] == "ok" else "נכשל", "פירוט": "" if v[0] == "ok" else v[1]}
+        for k, v in store.items()
+        if k[0] == ticker
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.write(f"מקורות בשימוש: {src}")
+    if tv_q is not None:
+        st.write("עמודות שהתקבלו מ-TradingView (רבעוני):")
+        st.write([str(c) for c in tv_q.columns])
+    if st.button("נסה שוב טעינה"):
+        for k in [k for k in store if k[0] == ticker]:
+            del store[k]
+        st.cache_data.clear()
+        st.rerun()
+
+st.caption("הכנסות, רווח למניה, שולי רווח נקי, חוב ותזרים מ-TradingView (ואם חסר, מ-yfinance). מחיר, עובדים ומכפיל עתידי מ-Yahoo. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
