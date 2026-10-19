@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
+
+try:
+    from tvscreener import get_financials
+except Exception:
+    get_financials = None
 
 st.set_page_config(page_title="מנתח מניות", page_icon="🔍", layout="wide")
 
@@ -19,12 +23,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# SEC דורש זיהוי אמיתי. החלף לשם ולכתובת המייל שלך (השאר את הפורמט: שם ואז מייל).
-SEC_HEADERS = {
-    "Nadav": "Nadav nadavtshuva2@gmail.com",
-    "Accept-Encoding": "gzip, deflate",
-}
-
 METRICS = [
     "הכנסות",
     "רווח למניה",
@@ -37,23 +35,17 @@ METRICS = [
 QUARTERLY = {"הכנסות", "רווח למניה", "שולי רווח נקי", "מכפיל רווח"}
 ANNUAL = {"יחס חוב לתזרים (שנתי)", "הכנסה לעובד (שנתי)"}
 
-SHOW_Q = 16  # כמה רבעונים מוצגים בגרף
-SHOW_Y = 8   # כמה שנים מוצגות בגרף
+SHOW_Q = 12
+SHOW_Y = 8
+EXCHANGES = ["NASDAQ", "NYSE", "AMEX"]
 
-REV_TAGS = [
-    "Revenues",
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
-    "SalesRevenueNet",
-]
-NI_TAGS = ["NetIncomeLoss", "ProfitLoss"]
-EPS_TAGS = ["EarningsPerShareDiluted", "EarningsPerShareBasic"]
-OCF_TAGS = ["NetCashProvidedByUsedInOperatingActivities"]
-CAPEX_TAGS = [
-    "PaymentsToAcquirePropertyPlantAndEquipment",
-    "PaymentsToAcquireProductiveAssets",
-    "PaymentsForCapitalImprovements",
-]
+REV_OPTS = [["total revenue"], ["revenue"]]
+NI_OPTS = [["net income"]]
+NI_EXCLUDE = ("per share", "before", "margin", "%", "growth", "discontinued")
+EPS_OPTS = [["diluted", "eps"], ["diluted", "earnings per share"], ["eps"], ["earnings per share"]]
+
+
+# ---------- עזרים ----------
 
 
 def fmt(v, kind="num"):
@@ -80,8 +72,25 @@ def fmt(v, kind="num"):
         return "—"
 
 
+def lab(d):
+    try:
+        return d.strftime("%Y-%m")
+    except Exception:
+        return str(d)
+
+
+def row(df, names):
+    """סדרה לפי תאריכים (מהישן לחדש) מדוחות yfinance."""
+    if df is None or df.empty:
+        return None
+    for n in names:
+        if n in df.index:
+            return df.loc[n].sort_index().dropna()
+    return None
+
+
 def draw(s, label, kind, window, unit, show, note=None):
-    """גרף קווי עם ממוצע נע, כרטיסי סיכום וטבלה. החישובים על כל ההיסטוריה, התצוגה על האחרונים."""
+    """גרף קווי עם ממוצע נע, כרטיסי סיכום וטבלה. החישוב על כל ההיסטוריה, התצוגה על האחרונים."""
     s = s.dropna()
     if s.empty:
         st.warning("אין נתונים להצגה.")
@@ -102,8 +111,8 @@ def draw(s, label, kind, window, unit, show, note=None):
         chg_name: chg,
         avg_chg_name: avg_chg,
     }).tail(show)
-    chart_df.index = [d.strftime("%Y-%m") for d in chart_df.index]
-    table_df.index = [d.strftime("%Y-%m") for d in table_df.index]
+    chart_df.index = [lab(d) for d in chart_df.index]
+    table_df.index = [lab(d) for d in table_df.index]
 
     m1, m2, m3 = st.columns(3)
     if ma.notna().any():
@@ -127,144 +136,61 @@ def draw(s, label, kind, window, unit, show, note=None):
         st.caption(note)
 
 
-# ---------- SEC EDGAR ----------
-# הפונקציות עם המטמון זורקות שגיאה בכשל, ולכן כשלים לא נשמרים.
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def sec_ticker_map():
-    r = requests.get("https://www.sec.gov/files/company_tickers.json",
-                     headers=SEC_HEADERS, timeout=20)
-    r.raise_for_status()
-    return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
+# ---------- TradingView ----------
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def sec_company_facts(cik):
-    r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
-                     headers=SEC_HEADERS, timeout=40)
-    r.raise_for_status()
-    return r.json()
+def tv_income_quarterly(ticker):
+    """דוח רווח והפסד רבעוני מ-TradingView. זורק שגיאה בכשל, ולכן כשלים לא נשמרים במטמון."""
+    if get_financials is None:
+        raise RuntimeError("ספריית tvscreener לא מותקנת")
+    sym = ticker.upper().replace("-", ".")
+    last = None
+    for ex in EXCHANGES:
+        try:
+            df = get_financials(f"{ex}:{sym}", "income_statement", "FQ")
+            if df is not None and len(df) > 0:
+                return df
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"TradingView לא החזיר נתונים ({type(last).__name__ if last else 'ריק'})")
 
 
-def get_sec(ticker):
-    """מחזיר (נתונים, הודעת שגיאה)."""
+def tv_prepare(df):
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        dcol = next(
+            (c for c in df.columns
+             if any(k in str(c).lower() for k in ("date", "period", "time"))),
+            None,
+        )
+        try:
+            df.index = pd.to_datetime(df[dcol]) if dcol is not None else pd.to_datetime(df.index)
+        except Exception:
+            pass
     try:
-        cik = sec_ticker_map().get(ticker.upper().replace(".", "-"))
-        if not cik:
-            return None, "הטיקר לא נמצא ברשימת SEC (ייתכן שזו חברה לא אמריקאית)"
-        return sec_company_facts(cik), None
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        return None, f"SEC החזיר שגיאה {code}"
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        df = df.sort_index()
+    except Exception:
+        pass
+    return df
 
 
-def _rows(facts, tag, unit):
-    gaap = facts.get("facts", {}).get("us-gaap", {})
-    if tag not in gaap:
-        return None
-    vals = gaap[tag].get("units", {}).get(unit)
-    if not vals:
-        return None
-    rows = [
-        {
-            "end": pd.to_datetime(v.get("end")),
-            "start": pd.to_datetime(v.get("start")),
-            "val": v.get("val"),
-            "filed": v.get("filed", ""),
-        }
-        for v in vals
-        if v.get("form") in ("10-Q", "10-K") and v.get("end")
-    ]
-    if not rows:
-        return None
-    return pd.DataFrame(rows).sort_values(["end", "start", "filed"])
+def col_series(df, options, exclude=()):
+    for inc_words in options:
+        for c in df.columns:
+            n = str(c).lower()
+            if all(k in n for k in inc_words) and not any(x in n for x in exclude):
+                s = pd.to_numeric(df[c], errors="coerce").dropna()
+                if not s.empty:
+                    return s
+    return None
 
 
-def _merge(series_list):
-    """מאחד סדרות מכמה תגיות: הסדרה העדכנית ביותר קודמת, האחרות ממלאות חורים."""
-    series_list = [s for s in series_list if s is not None and not s.empty]
-    if not series_list:
-        return None
-    series_list.sort(key=lambda s: s.index.max(), reverse=True)
-    out = series_list[0]
-    for s in series_list[1:]:
-        out = out.combine_first(s)
-    return out.sort_index()
-
-
-def _quarterly(df):
-    df = df[df["start"].notna()]
-    if df.empty:
-        return None
-    dur = (df["end"] - df["start"]).dt.days
-    q = (df[dur.between(70, 100)].drop_duplicates("end", keep="last")
-         .set_index("end")["val"].sort_index())
-    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
-    extra = {}
-    for _, r in a.iterrows():
-        if r["end"] in q.index:
-            continue
-        inside = q[(q.index > r["start"]) & (q.index < r["end"])]
-        if len(inside) == 3:
-            extra[r["end"]] = r["val"] - inside.sum()
-    if extra:
-        q = pd.concat([q, pd.Series(extra)]).sort_index()
-    return q if not q.empty else None
-
-
-def _annual(df):
-    df = df[df["start"].notna()]
-    if df.empty:
-        return None
-    dur = (df["end"] - df["start"]).dt.days
-    a = df[dur.between(350, 380)].drop_duplicates("end", keep="last")
-    return a.set_index("end")["val"].sort_index() if not a.empty else None
-
-
-def _instant(df):
-    df = df[df["start"].isna()].drop_duplicates("end", keep="last")
-    return df.set_index("end")["val"].sort_index() if not df.empty else None
-
-
-def sec_series(facts, tags, kind, unit="USD"):
-    if not facts:
-        return None
-    fn = {"q": _quarterly, "a": _annual, "i": _instant}[kind]
-    out = []
-    for tag in tags:
-        df = _rows(facts, tag, unit)
-        if df is not None:
-            out.append(fn(df))
-    return _merge(out)
-
-
-def sec_total_debt(facts):
-    s = sec_series(facts, ["DebtLongtermAndShorttermCombinedAmount"], "i")
-    if s is not None:
-        return s
-    lt = sec_series(facts, ["LongTermDebtNoncurrent"], "i")
-    sh = sec_series(facts, ["LongTermDebtCurrent", "DebtCurrent"], "i")
-    if lt is None and sh is None:
-        return None
-    if lt is None:
-        return sh
-    if sh is None:
-        return lt
-    return pd.concat([lt, sh], axis=1).fillna(0).sum(axis=1)
-
-
-def sec_fcf_annual(facts):
-    ocf = sec_series(facts, OCF_TAGS, "a")
-    capex = sec_series(facts, CAPEX_TAGS, "a")
-    if ocf is None or capex is None:
-        return None
-    df = pd.concat([ocf, capex], axis=1, keys=["ocf", "capex"]).dropna()
-    if df.empty:
-        return None
-    return df["ocf"] - df["capex"].abs()
+def to_usd(s):
+    """אם הערכים קטנים מאוד, מניחים שהם במיליונים."""
+    if s is not None and not s.empty and s.abs().max() < 1e6:
+        return s * 1e6
+    return s
 
 
 # ---------- yfinance ----------
@@ -290,21 +216,31 @@ def load_market(ticker):
     hist = t.history(period="max")
     if hist.index.tz is not None:
         hist.index = hist.index.tz_localize(None)
-    return info, hist
+    return {
+        "info": info,
+        "hist": hist,
+        "qinc": t.quarterly_income_stmt,
+        "inc": t.income_stmt,
+        "bal": t.balance_sheet,
+        "cf": t.cashflow,
+    }
 
 
 def pe_series(eps_q, hist):
     """מכפיל TTM: מחיר בסוף הרבעון חלקי סכום EPS של 4 רבעונים."""
-    if eps_q is None or len(eps_q) < 4 or hist.empty:
+    try:
+        if eps_q is None or len(eps_q) < 4 or hist.empty:
+            return None
+        ttm = eps_q.rolling(4).sum().dropna()
+        out = {}
+        for d, e in ttm.items():
+            if e and e > 0:
+                px = hist["Close"][hist.index <= d]
+                if not px.empty:
+                    out[d] = px.iloc[-1] / e
+        return pd.Series(out) if out else None
+    except Exception:
         return None
-    ttm = eps_q.rolling(4).sum().dropna()
-    out = {}
-    for d, e in ttm.items():
-        if e and e > 0:
-            px = hist["Close"][hist.index <= d]
-            if not px.empty:
-                out[d] = px.iloc[-1] / e
-    return pd.Series(out) if out else None
 
 
 # ---------- דף הבית ----------
@@ -335,19 +271,41 @@ with mid:
 
 ticker = st.session_state.ticker
 if not ticker:
-    st.info("חפש מנייה כדי להתחיל. הנתונים הפונדמנטליים מגיעים מ-SEC EDGAR, ולכן מכוסות חברות הרשומות בארה\"ב.")
+    st.info("חפש מנייה כדי להתחיל.")
     st.stop()
 
 with st.spinner(f"טוען נתונים עבור {ticker}..."):
-    info, hist = load_market(ticker)
-    facts, sec_err = get_sec(ticker)
+    m = load_market(ticker)
+    tv_err, tvdf = None, None
+    try:
+        tvdf = tv_prepare(tv_income_quarterly(ticker))
+    except Exception as e:
+        tv_err = str(e)
 
+info, hist = m["info"], m["hist"]
 if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
     st.error("לא הצלחתי למשוך נתוני מחיר לטיקר הזה.")
     st.stop()
 
-if facts is None:
-    st.warning(f"לא נמצאו נתוני SEC לטיקר הזה. סיבה: {sec_err}")
+# ---------- נתונים רבעוניים: TradingView, ואם חסר אז yfinance ----------
+
+src = {}
+rev_q = ni_q = eps_q = None
+if tvdf is not None:
+    rev_q = to_usd(col_series(tvdf, REV_OPTS))
+    ni_q = to_usd(col_series(tvdf, NI_OPTS, NI_EXCLUDE))
+    eps_q = col_series(tvdf, EPS_OPTS)
+    src = {"rev": "TradingView", "ni": "TradingView", "eps": "TradingView"}
+
+if rev_q is None:
+    rev_q, src["rev"] = row(m["qinc"], ["Total Revenue"]), "yfinance"
+if ni_q is None:
+    ni_q, src["ni"] = row(m["qinc"], ["Net Income"]), "yfinance"
+if eps_q is None:
+    eps_q, src["eps"] = row(m["qinc"], ["Diluted EPS", "Basic EPS"]), "yfinance"
+
+if tv_err:
+    st.warning(f"TradingView לא זמין כרגע: {tv_err}. מוצגים נתוני yfinance (עד 5 רבעונים).")
 
 employees = info.get("fullTimeEmployees")
 
@@ -364,36 +322,28 @@ n = 4
 if metric in QUARTERLY:
     n = st.slider("ממוצע נע (מספר רבעונים)", 2, 8, 4)
 elif metric in ANNUAL:
-    n = st.slider("ממוצע נע (מספר שנים)", 2, 5, 2)
+    n = st.slider("ממוצע נע (מספר שנים)", 2, 4, 2)
 
 st.markdown(f"### {metric}")
-
-rev_q = sec_series(facts, REV_TAGS, "q")
-ni_q = sec_series(facts, NI_TAGS, "q")
-eps_q = sec_series(facts, EPS_TAGS, "q", "USD/shares")
-rev_a = sec_series(facts, REV_TAGS, "a")
-debt_i = sec_total_debt(facts)
-fcf_a = sec_fcf_annual(facts)
 
 # ---------- הגרפים ----------
 
 if metric == "הכנסות":
     if rev_q is None:
-        st.warning("אין נתוני הכנסות רבעוניות מ-SEC לטיקר הזה.")
+        st.warning("אין נתוני הכנסות רבעוניות לטיקר הזה.")
     else:
         if rev_q.tail(SHOW_Q).abs().max() >= 1e9:
             scale, tag = 1e9, "B"
         else:
             scale, tag = 1e6, "M"
         draw(rev_q / scale, f"הכנסות ({tag})", tag, n, "רבעונים", SHOW_Q,
-             "B = מיליארדים, M = מיליונים. מקור: SEC EDGAR.")
+             f"B = מיליארדים, M = מיליונים. מקור: {src['rev']}.")
 
 elif metric == "רווח למניה":
     if eps_q is None:
-        st.warning("אין נתוני רווח למניה מ-SEC לטיקר הזה.")
+        st.warning("אין נתוני רווח למניה לטיקר הזה.")
     else:
-        draw(eps_q, "רווח למניה", "num", n, "רבעונים", SHOW_Q,
-             "רבעון 4 מחושב כרווח שנתי פחות שלושת הרבעונים הראשונים, ולכן הוא קירוב. מקור: SEC EDGAR.")
+        draw(eps_q, "רווח למניה", "num", n, "רבעונים", SHOW_Q, f"מקור: {src['eps']}.")
 
 elif metric == "שולי רווח נקי":
     if rev_q is None or ni_q is None:
@@ -401,15 +351,16 @@ elif metric == "שולי רווח נקי":
     else:
         df = pd.concat([ni_q, rev_q], axis=1, keys=["ni", "rev"]).dropna()
         draw(df["ni"] / df["rev"] * 100, "שולי רווח נקי", "pct", n, "רבעונים", SHOW_Q,
-             "רווח נקי באחוזים מההכנסות. מקור: SEC EDGAR.")
+             f"רווח נקי באחוזים מההכנסות. מקור: {src['ni']}.")
 
 elif metric == "מכפיל רווח":
+    st.metric("מכפיל רווח נוכחי (yfinance)", fmt(info.get("trailingPE"), "x"))
     pe = pe_series(eps_q, hist)
     if pe is None:
-        st.warning("אין מספיק נתוני רווח למניה לחישוב מכפיל (נדרשים 4 רבעונים לפחות).")
+        st.warning("אין מספיק נתוני רווח למניה לחישוב מכפיל היסטורי (נדרשים 4 רבעונים לפחות).")
     else:
         draw(pe, "מכפיל רווח", "x", n, "רבעונים", SHOW_Q,
-             "מחיר בסוף הרבעון (yfinance) חלקי סכום רווח למניה של 4 רבעונים (SEC).")
+             f"מחיר בסוף הרבעון (yfinance) חלקי סכום רווח למניה של 4 רבעונים ({src['eps']}).")
 
 elif metric == "מכפיל רווח עתידי":
     fwd = info.get("forwardPE")
@@ -421,27 +372,35 @@ elif metric == "מכפיל רווח עתידי":
         df = pd.DataFrame({"מכפיל היסטורי": pe}).tail(SHOW_Q)
         if fwd is not None and not pd.isna(fwd):
             df["מכפיל עתידי (נוכחי)"] = fwd
-        df.index = [dte.strftime("%Y-%m") for dte in df.index]
+        df.index = [lab(d) for d in df.index]
         st.line_chart(df)
     st.caption("אין היסטוריה של מכפיל עתידי. הקו השטוח הוא ערכו הנוכחי, להשוואה בלבד. מקור: yfinance.")
 
 elif metric == "יחס חוב לתזרים (שנתי)":
-    if debt_i is None or fcf_a is None:
-        st.warning("אין נתוני חוב או תזרים חופשי שנתיים מ-SEC לטיקר הזה.")
+    debt = row(m["bal"], ["Total Debt"])
+    fcf = row(m["cf"], ["Free Cash Flow"])
+    if debt is None or fcf is None:
+        st.warning("אין נתוני חוב או תזרים חופשי שנתיים.")
     else:
-        df = pd.concat([debt_i, fcf_a], axis=1, keys=["debt", "fcf"]).dropna()
+        df = pd.concat([debt, fcf], axis=1, keys=["debt", "fcf"]).dropna()
         df = df[df["fcf"] > 0]
         if df.empty:
-            st.warning("אין שנים עם תזרים חופשי חיובי ונתוני חוב תואמים, ולכן היחס אינו בעל משמעות.")
+            st.warning("התזרים החופשי שלילי בכל השנים הזמינות, ולכן היחס אינו בעל משמעות.")
         else:
             draw(df["debt"] / df["fcf"], "חוב / תזרים חופשי", "x", n, "שנים", SHOW_Y,
-                 "חוב כולל חלקי תזרים חופשי (תזרים תפעולי פחות השקעות הוניות). מקור: SEC EDGAR.")
+                 "חוב כולל חלקי תזרים חופשי. שנים עם תזרים שלילי לא מוצגות. מקור: yfinance.")
 
 elif metric == "הכנסה לעובד (שנתי)":
+    rev_a = row(m["inc"], ["Total Revenue"])
     if rev_a is None or not employees:
-        st.warning("אין נתוני הכנסות שנתיות מ-SEC או מספר עובדים.")
+        st.warning("אין נתוני הכנסות שנתיות או מספר עובדים.")
     else:
         draw(rev_a / employees, "הכנסה לעובד", "money", n, "שנים", SHOW_Y,
-             f"הכנסה שנתית (SEC) חלקי מספר העובדים הנוכחי ({employees:,}, yfinance). לשנים קודמות זה קירוב.")
+             f"הכנסה שנתית חלקי מספר העובדים הנוכחי ({employees:,}). לשנים קודמות זה קירוב. מקור: yfinance.")
 
-st.caption("נתונים פונדמנטליים מ-SEC EDGAR, מחיר ומכפיל עתידי מ-yfinance. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
+if tvdf is not None:
+    with st.expander("מידע טכני: העמודות שהתקבלו מ-TradingView"):
+        st.write(list(tvdf.columns))
+        st.write(f"מקורות בשימוש: {src}")
+
+st.caption("הכנסות, רווח למניה ושולי רווח נקי מ-TradingView (ואם לא זמין, yfinance). שאר הנתונים מ-yfinance. ייתכנו חוסרים או אי-דיוקים. אין לראות בזה ייעוץ השקעות.")
